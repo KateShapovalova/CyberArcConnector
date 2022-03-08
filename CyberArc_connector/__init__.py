@@ -6,11 +6,15 @@ import hashlib
 import hmac
 import base64
 import logging
+
+from azure.functions import TimerRequest
+
 from pyepm import getAggregatedEvents, getDetailedRawEvents, epmAuth, getSetsList
 import os
 from datetime import datetime, timedelta
 import json
 from state_manager import StateManager
+import azure.functions as func
 
 # Set variables
 dispatcher = os.environ['DISPATCHER']
@@ -43,7 +47,7 @@ def generate_date():
         logging.info("The last time point is: {}".format(past_time))
     else:
         logging.info("There is no last time point, trying to get events for last hour.")
-        past_time = (current_time - timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        past_time = (current_time - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
     # state.post(current_time.strftime("%Y-%m-%dT%H:%M:%SZ"))
     return past_time, current_time.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -65,13 +69,10 @@ def post_data(customer_id, shared_key, body):
     }
 
     response = requests.post(uri, data=body, headers=headers)
-
     if 200 <= response.status_code <= 299:
-        print('Accepted')
+        logging.info("Logs with {} activity was processed into Azure".format(log_type))
     else:
-        err = f'Response code "{response.status_code}" while sending data through data-collector API.'
-        logging.error(err)
-        raise Exception(err)
+        logging.warning("Response code: {}".format(response.status_code))
 
 
 def gen_chunks_to_object(data, chunk_size=100):
@@ -86,8 +87,10 @@ def gen_chunks_to_object(data, chunk_size=100):
 
 def gen_chunks(data):
     for chunk in gen_chunks_to_object(data, chunk_size=2000):
+        chunk_size = len(chunk)
         body = json.dumps(chunk)
         post_data(workspace_id, workspace_key, body)
+        logging.info("Logs with {} chunk size was injected".format(chunk_size))
 
 
 def get_events(func_name, auth, filter_date, set_id, next_cursor="start"):
@@ -102,11 +105,20 @@ def get_events(func_name, auth, filter_date, set_id, next_cursor="start"):
                                    next_cursor=events_json["nextCursor"])
         events_json["events"] += response_json["events"]
 
+    if events_json is None or len(events_json) == 0:
+        logging.info("Logs not founded for {} activity".format(log_type))
+    else:
+        logging.info("Activity - {}, processing {} events)".format(log_type, len(events_json)))
+
     return events_json
 
 
-def main() -> None:
+def main(mytimer: func.TimerRequest) -> None:
+    if mytimer.past_due:
+        logging.info('The timer is past due!')
+    logging.info('Starting program')
     start_time, end_time = generate_date()
+    logging.info('Data processing. Period(UTC): {} - {}'.format(start_time, end_time))
     auth = epmAuth(dispatcher=dispatcher, username=username, password=password)
     sets_list = getSetsList(epmserver=dispatcher, epmToken=auth.json()['EPMAuthenticationResult'], authType='EPM')
     filter_date = '{"filter": "eventDate GE ' + str(start_time) + ' AND eventDate LE ' + end_time + '"}'
@@ -126,4 +138,9 @@ def main() -> None:
     gen_chunks(aggregated_events + raw_events)
 
 
-main()
+class MyTimer(TimerRequest):
+    def past_due(self) -> bool:
+        return False
+
+
+main(MyTimer())
